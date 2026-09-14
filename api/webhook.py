@@ -1,45 +1,48 @@
 """
 api/webhook.py
 
-Receives the Supabase Database Webhook fired when a new row is inserted
-into activity_history, calls the ML API over HTTP (see api/ml_client.py),
-and writes the prediction into wellness_scores.final_energy_level for the
-SAME user only.
+Handles Supabase INSERT webhooks from:
 
-This module is an APIRouter mounted onto the main FastAPI app in
-api/main.py, so `/health` and `/predict` keep working completely
-independently of everything here.
+    public.activity_history
 
 Flow:
-    1. Verify the shared webhook secret (if WEBHOOK_SECRET is configured).
-    2. Parse + validate the webhook payload.
-    3. Only handle INSERT events on activity_history; anything else is a
-       400 (nothing to do, and we don't want Supabase to keep retrying a
-       request that will never apply cleanly).
-    4. Check idempotency via activity_history.process (see
-       api/supabase_client.py for why this re-reads from the DB instead of
-       trusting the payload).
-    5. Read the user's current final_energy_level from wellness_scores.
-    6. Map Supabase field names -> ML field names.
-    7. Call the ML API over HTTP (ML_MODEL_URL) to get predicted_score.
-    8. Write predicted_score into wellness_scores.final_energy_level for
-       that SAME user only.
-    9. Mark the activity as processed.
-   10. Return a JSON summary of every step's values.
+
+    activity_history INSERT
+            |
+            v
+    /webhook/activity
+            |
+            +--> get activity_type
+            |
+            +--> get activity_history.energy_level
+            |
+            +--> find SAME user in wellness_scores
+            |
+            +--> read wellness_scores.final_energy_level
+            |
+            +--> run the already-loaded ML model
+            |
+            +--> update SAME user's
+                 wellness_scores.final_energy_level
+            |
+            +--> mark activity_history.process = "done"
+
+No database schema changes are required.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import secrets
 from typing import Any, Dict, Optional
 from uuid import UUID
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Header, HTTPException, Request
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from api.ml_client import MLServiceError, call_ml_api
 from api.supabase_client import (
     ActivityRecordNotFoundError,
     WellnessRecordNotFoundError,
@@ -51,110 +54,265 @@ from api.supabase_client import (
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("svs-ml.webhook")
-
-# Optional shared-secret check. If unset, the webhook runs WITHOUT
-# authentication — fine for local testing, never for production.
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-
-ALLOWED_ACTIVITY_TYPES = ["mood", "meditation", "journal", "community", "music"]
 
 router = APIRouter()
 
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# ---------------------------------------------------------------------------
-# Webhook request/response schemas
-# ---------------------------------------------------------------------------
+ALLOWED_ACTIVITY_TYPES = {
+    "mood",
+    "meditation",
+    "journal",
+    "community",
+    "music",
+}
+
+
+# ============================================================
+# SUPABASE ACTIVITY RECORD
+# ============================================================
+
 class ActivityRecord(BaseModel):
     """
-    The activity_history fields we need, as delivered inside a Supabase
-    Database Webhook payload's "record" object. Field names match the
-    Supabase schema EXACTLY — no renaming happens on this model.
+    Fields from public.activity_history.
+
+    These names match the Supabase columns exactly.
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     id: UUID
+
     user_id: UUID
+
     activity_type: str
-    energy_level: Optional[float] = Field(default=None, ge=0, le=100)
+
+    # public.activity_history.energy_level
+    energy_level: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=100,
+    )
+
     metadata: Optional[Dict[str, Any]] = None
+
+    # NULL before processing, "done" after processing.
     process: Optional[str] = None
+
     created_at: Optional[str] = None
 
-    class Config:
-        extra = "ignore"  # title/subtitle and any other columns are irrelevant here
 
+# ============================================================
+# SUPABASE WEBHOOK PAYLOAD
+# ============================================================
 
 class SupabaseWebhookPayload(BaseModel):
-    """Shape of a Supabase Database Webhook POST body."""
+    """
+    Standard Supabase Database Webhook payload.
+    """
 
-    type: str  # "INSERT", "UPDATE", "DELETE"
+    model_config = ConfigDict(
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    type: str
+
     table: str
+
     record: ActivityRecord
-    schema_: Optional[str] = Field(default=None, alias="schema")
 
-    class Config:
-        populate_by_name = True
+    old_record: Optional[Dict[str, Any]] = None
 
+    schema_name: Optional[str] = Field(
+        default=None,
+        alias="schema",
+    )
+
+
+# ============================================================
+# RESPONSE
+# ============================================================
 
 class WebhookResponse(BaseModel):
     success: bool
+    message: str
+
     user_id: str
+    activity_id: str
     activity_type: str
+
     activity_energy_level: float
     current_energy_level: float
     predicted_score: float
 
+    process: str
 
-# ---------------------------------------------------------------------------
-# Field mapping (the one place this happens)
-# ---------------------------------------------------------------------------
-def resolve_activity_energy_level(activity: ActivityRecord) -> float:
+
+# ============================================================
+# VERIFY WEBHOOK SECRET
+# ============================================================
+
+def verify_webhook_secret(
+    received_secret: Optional[str],
+) -> None:
     """
-    Determine activity_energy_level from the activity_history record.
-
-    Primary source: activity_history.energy_level (already validated 0-100
-    by ActivityRecord above).
-
-    Fallback: if energy_level is NULL for some reason but metadata carries
-    an equivalent value (e.g. {"energy_level": 50} or {"svs_value": 50}),
-    use that instead of failing outright. This only matters for activity
-    types where energy_level might legitimately be populated asynchronously
-    — remove this fallback entirely if your application never does that.
+    Verify X-Webhook-Secret sent by Supabase.
     """
+
+    if not WEBHOOK_SECRET:
+        logger.error(
+            "WEBHOOK_SECRET is not configured in .env"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="WEBHOOK_SECRET is not configured.",
+        )
+
+    if not received_secret:
+        logger.warning(
+            "Webhook rejected: missing X-Webhook-Secret"
+        )
+
+        raise HTTPException(
+            status_code=401,
+            detail="Missing webhook secret.",
+        )
+
+    if not secrets.compare_digest(
+        received_secret,
+        WEBHOOK_SECRET,
+    ):
+        logger.warning(
+            "Webhook rejected: invalid X-Webhook-Secret"
+        )
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid webhook secret.",
+        )
+
+
+# ============================================================
+# GET ACTIVITY ENERGY
+# ============================================================
+
+def resolve_activity_energy_level(
+    activity: ActivityRecord,
+) -> float:
+    """
+    Get the activity energy level.
+
+    Primary source:
+
+        activity_history.energy_level
+
+    Optional fallback:
+
+        activity_history.metadata.energy_level
+        activity_history.metadata.activity_energy_level
+        activity_history.metadata.svs_value
+
+    We do NOT invent an energy value.
+    """
+
+    # --------------------------------------------------------
+    # PRIMARY SOURCE
+    # --------------------------------------------------------
+
     if activity.energy_level is not None:
-        return float(activity.energy_level)
 
-    if activity.metadata:
-        for key in ("energy_level", "activity_energy_level", "svs_value"):
-            value = activity.metadata.get(key)
-            if value is not None:
-                try:
-                    numeric_value = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= numeric_value <= 100:
-                    return numeric_value
+        value = float(activity.energy_level)
+
+        logger.info(
+            "Using activity_history.energy_level=%s",
+            value,
+        )
+
+        return value
+
+    # --------------------------------------------------------
+    # OPTIONAL METADATA FALLBACK
+    # --------------------------------------------------------
+
+    metadata = activity.metadata or {}
+
+    possible_keys = (
+        "energy_level",
+        "activity_energy_level",
+        "svs_value",
+    )
+
+    for key in possible_keys:
+
+        value = metadata.get(key)
+
+        if value is None:
+            continue
+
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            continue
+
+        if 0 <= numeric_value <= 100:
+
+            logger.info(
+                "activity_history.energy_level is NULL. "
+                "Using metadata.%s=%s",
+                key,
+                numeric_value,
+            )
+
+            return numeric_value
+
+    # --------------------------------------------------------
+    # NO ENERGY FOUND
+    # --------------------------------------------------------
+
+    logger.error(
+        "Activity %s has no activity energy value.",
+        activity.id,
+    )
 
     raise HTTPException(
-        status_code=400,
-        detail=(
-            f"Could not determine activity_energy_level for activity id='{activity.id}': "
-            "energy_level is NULL and no usable value was found in metadata."
-        ),
+        status_code=422,
+        detail={
+            "message": (
+                "activity_history.energy_level is NULL "
+                "and no usable energy value exists in metadata."
+            ),
+            "activity_id": str(activity.id),
+            "required_column": "activity_history.energy_level",
+            "expected_range": "0-100",
+        },
     )
 
 
-def supabase_activity_to_ml_input(
-    activity: ActivityRecord, activity_energy_level: float, current_energy_level: float
+# ============================================================
+# MAP SUPABASE DATA -> ML DATA
+# ============================================================
+
+def build_ml_input(
+    activity: ActivityRecord,
+    activity_energy_level: float,
+    current_energy_level: float,
 ) -> Dict[str, Any]:
     """
-    Build the ML API's request body from Supabase field values.
+    Explicit mapping:
 
-        activity_history.activity_type        -> ML activity_type (unchanged)
-        activity_history.energy_level          -> ML activity_energy_level
-        wellness_scores.final_energy_level     -> ML current_energy_level
+    activity_history.activity_type
+        -> ML activity_type
+
+    activity_history.energy_level
+        -> ML activity_energy_level
+
+    wellness_scores.final_energy_level
+        -> ML current_energy_level
     """
+
     return {
         "activity_type": activity.activity_type,
         "activity_energy_level": activity_energy_level,
@@ -162,140 +320,482 @@ def supabase_activity_to_ml_input(
     }
 
 
-def _safe_log_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Return a copy of a payload dict safe to log: never logs anything that
-    could be a secret or credential, even if such a field were ever added
-    to the payload shape in the future.
-    """
-    redacted_keys = {"secret", "webhook_secret", "service_role_key", "authorization", "token", "password"}
-    return {
-        key: ("<redacted>" if key.lower() in redacted_keys else value)
-        for key, value in payload.items()
-    }
+# ============================================================
+# WEBHOOK ENDPOINT
+# ============================================================
 
-
-# ---------------------------------------------------------------------------
-# Endpoint
-# ---------------------------------------------------------------------------
-@router.post("/webhook/activity", response_model=WebhookResponse)
+@router.post(
+    "/webhook/activity",
+    response_model=WebhookResponse,
+)
 async def handle_activity_webhook(
     request: Request,
-    x_webhook_secret: Optional[str] = Header(default=None),
+    x_webhook_secret: Optional[str] = Header(
+        default=None,
+        alias="X-Webhook-Secret",
+    ),
 ) -> WebhookResponse:
-    # --- 1. Verify shared secret, if configured -----------------------
-    if WEBHOOK_SECRET:
-        if not x_webhook_secret or x_webhook_secret != WEBHOOK_SECRET:
-            logger.warning("Webhook rejected: missing or invalid X-Webhook-Secret header.")
-            raise HTTPException(status_code=401, detail="Invalid or missing webhook secret.")
-    else:
-        logger.warning(
-            "WEBHOOK_SECRET is not configured — /webhook/activity is running "
-            "WITHOUT authentication. Set WEBHOOK_SECRET before deploying."
-        )
 
-    # --- 2. Parse + validate payload -----------------------------------
+    # ========================================================
+    # STEP 1 — VERIFY SECRET
+    # ========================================================
+
+    verify_webhook_secret(x_webhook_secret)
+
+    # ========================================================
+    # STEP 2 — READ JSON
+    # ========================================================
+
     try:
         raw_body = await request.json()
-    except Exception as exc:
-        logger.error(f"Webhook rejected: malformed JSON body ({exc}).")
-        raise HTTPException(status_code=400, detail="Malformed JSON payload.") from exc
 
-    logger.info(f"Webhook payload received (safe view): {_safe_log_payload(raw_body)}")
+    except Exception as exc:
+
+        logger.exception(
+            "Invalid JSON received from Supabase."
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON webhook body.",
+        ) from exc
+
+    logger.info(
+        "Webhook received: type=%s table=%s",
+        raw_body.get("type"),
+        raw_body.get("table"),
+    )
+
+    # ========================================================
+    # STEP 3 — VALIDATE SUPABASE PAYLOAD
+    # ========================================================
 
     try:
-        payload = SupabaseWebhookPayload.model_validate(raw_body)
+        payload = SupabaseWebhookPayload.model_validate(
+            raw_body
+        )
+
     except ValidationError as exc:
-        logger.error(f"Webhook rejected: payload failed validation ({exc}).")
+
+        logger.error(
+            "Supabase webhook payload validation failed: %s",
+            exc,
+        )
+
         raise HTTPException(
-            status_code=400, detail=f"Invalid webhook payload: {exc.errors()}"
+            status_code=400,
+            detail={
+                "message": "Invalid Supabase webhook payload.",
+                "errors": exc.errors(),
+            },
         ) from exc
 
     activity = payload.record
+
     logger.info(
-        f"Webhook parsed: type={payload.type} table={payload.table} "
-        f"activity_id={activity.id} user_id={activity.user_id} "
-        f"activity_type={activity.activity_type}"
+        "Activity received: id=%s user_id=%s "
+        "activity_type=%s energy_level=%s process=%s",
+        activity.id,
+        activity.user_id,
+        activity.activity_type,
+        activity.energy_level,
+        activity.process,
     )
 
-    # --- 3. Only handle INSERT events on activity_history ---------------
+    # ========================================================
+    # STEP 4 — CHECK TABLE
+    # ========================================================
+
     if payload.table != "activity_history":
-        logger.info(f"Rejecting webhook for unrelated table '{payload.table}'.")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unexpected table '{payload.table}', expected 'activity_history'.",
-        )
-    if payload.type != "INSERT":
-        logger.info(f"Rejecting non-INSERT event type '{payload.type}' for activity_id={activity.id}.")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported event type '{payload.type}', only INSERT is handled.",
-        )
-    if activity.activity_type not in ALLOWED_ACTIVITY_TYPES:
-        logger.error(f"Rejecting invalid activity_type='{activity.activity_type}' for activity_id={activity.id}.")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid activity_type '{activity.activity_type}'. Allowed: {ALLOWED_ACTIVITY_TYPES}",
+
+        logger.error(
+            "Wrong webhook table: %s",
+            payload.table,
         )
 
-    # --- 4. Idempotency check --------------------------------------------
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Expected 'activity_history', "
+                f"received '{payload.table}'."
+            ),
+        )
+
+    # ========================================================
+    # STEP 5 — ONLY INSERT
+    # ========================================================
+
+    if payload.type != "INSERT":
+
+        logger.info(
+            "Ignoring non-INSERT event: %s",
+            payload.type,
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported event type '{payload.type}'. "
+                "Only INSERT is supported."
+            ),
+        )
+
+    # ========================================================
+    # STEP 6 — CHECK ACTIVITY TYPE
+    # ========================================================
+
+    if activity.activity_type not in ALLOWED_ACTIVITY_TYPES:
+
+        logger.error(
+            "Invalid activity_type=%s",
+            activity.activity_type,
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Invalid activity_type.",
+                "received": activity.activity_type,
+                "allowed": sorted(ALLOWED_ACTIVITY_TYPES),
+            },
+        )
+
+    # ========================================================
+    # STEP 7 — CHECK PROCESS
+    # ========================================================
+
     try:
-        already_processed = is_activity_already_processed(str(activity.id))
+
+        already_processed = is_activity_already_processed(
+            str(activity.id)
+        )
+
     except ActivityRecordNotFoundError as exc:
-        logger.error(f"Activity id={activity.id} not found in activity_history: {exc}")
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        logger.error(
+            "Activity %s was not found in activity_history.",
+            activity.id,
+        )
+
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
 
     if already_processed:
-        logger.info(f"Skipping already-processed activity_id={activity.id} (process != NULL).")
+
+        logger.info(
+            "Activity %s already processed. Skipping.",
+            activity.id,
+        )
+
         raise HTTPException(
-            status_code=409, detail=f"Activity '{activity.id}' has already been processed."
+            status_code=409,
+            detail=(
+                f"Activity '{activity.id}' "
+                "has already been processed."
+            ),
         )
 
-    # --- 5. Determine activity_energy_level ------------------------------
-    activity_energy_level = resolve_activity_energy_level(activity)
+    # ========================================================
+    # STEP 8 — GET ACTIVITY ENERGY
+    # ========================================================
 
-    # --- 6. Look up the SAME user's current wellness_scores value --------
+    activity_energy_level = resolve_activity_energy_level(
+        activity
+    )
+
+    logger.info(
+        "Activity energy level = %s",
+        activity_energy_level,
+    )
+
+    # ========================================================
+    # STEP 9 — GET CURRENT USER ENERGY
+    # ========================================================
+
+    """
+    IMPORTANT:
+
+    activity.user_id comes from:
+
+        activity_history.user_id
+
+    We use that SAME user_id to find:
+
+        wellness_scores.user_id
+
+    Then we read:
+
+        wellness_scores.final_energy_level
+    """
+
     try:
-        current_energy_level = get_current_energy_level(str(activity.user_id))
+
+        current_energy_level = get_current_energy_level(
+            str(activity.user_id)
+        )
+
     except WellnessRecordNotFoundError as exc:
-        logger.error(f"No wellness_scores record for user_id={activity.user_id}: {exc}")
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    logger.info(f"Fetched current_energy_level={current_energy_level} for user_id={activity.user_id}")
 
-    # --- 7. Map Supabase field names to ML field names -------------------
-    ml_input = supabase_activity_to_ml_input(activity, activity_energy_level, current_energy_level)
-    logger.info(f"Mapped ML input: {ml_input}")
+        logger.error(
+            "No wellness_scores record found for user_id=%s",
+            activity.user_id,
+        )
 
-    # --- 8. Call the ML API over HTTP ------------------------------------
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+
+    logger.info(
+        "Current wellness score for user_id=%s = %s",
+        activity.user_id,
+        current_energy_level,
+    )
+
+    # ========================================================
+    # STEP 10 — CREATE ML INPUT
+    # ========================================================
+
+    ml_input = build_ml_input(
+        activity=activity,
+        activity_energy_level=activity_energy_level,
+        current_energy_level=current_energy_level,
+    )
+
+    logger.info(
+        "ML input: %s",
+        ml_input,
+    )
+
+    # ========================================================
+    # STEP 11 — RUN ML MODEL DIRECTLY
+    # ========================================================
+
+    """
+    IMPORTANT:
+
+    /webhook/activity and /predict are inside the SAME
+    FastAPI application.
+
+    Therefore we do NOT make an HTTP request to:
+
+        http://127.0.0.1:8000/predict
+
+    That was causing the 10-second timeout.
+
+    Instead, we directly call the already-loaded model
+    prediction function from api.main.
+
+    asyncio.to_thread() prevents the synchronous model
+    prediction from blocking the FastAPI event loop.
+    """
+
     try:
-        predicted_score = call_ml_api(
+
+        # Imported here to avoid an import cycle during startup.
+        from api.main import run_model_prediction
+
+        predicted_score = await asyncio.to_thread(
+            run_model_prediction,
             activity_type=ml_input["activity_type"],
-            activity_energy_level=ml_input["activity_energy_level"],
-            current_energy_level=ml_input["current_energy_level"],
+            activity_energy_level=ml_input[
+                "activity_energy_level"
+            ],
+            current_energy_level=ml_input[
+                "current_energy_level"
+            ],
         )
-    except MLServiceError as exc:
-        # Never write anything to wellness_scores if the ML call failed.
-        logger.error(f"ML API call failed for activity_id={activity.id}: {exc}")
-        raise HTTPException(status_code=502, detail=f"ML API call failed: {exc}") from exc
 
-    logger.info(f"ML API returned predicted_score={predicted_score} for user_id={activity.user_id}")
+    except Exception as exc:
 
-    # --- 9. Update ONLY this user's wellness_scores.final_energy_level ---
+        logger.exception(
+            "ML prediction failed for activity_id=%s",
+            activity.id,
+        )
+
+        # IMPORTANT:
+        #
+        # Do NOT update wellness_scores.
+        # Do NOT mark activity as done.
+        #
+        # The activity remains unprocessed.
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "ML prediction failed.",
+                "activity_id": str(activity.id),
+                "error": str(exc),
+            },
+        ) from exc
+
+    logger.info(
+        "ML prediction successful: "
+        "activity_id=%s user_id=%s predicted_score=%s",
+        activity.id,
+        activity.user_id,
+        predicted_score,
+    )
+
+    # ========================================================
+    # STEP 12 — VALIDATE PREDICTION
+    # ========================================================
+
     try:
-        update_user_energy_level(str(activity.user_id), predicted_score)
-    except WellnessRecordNotFoundError as exc:
-        logger.error(f"Failed to update wellness_scores for user_id={activity.user_id}: {exc}")
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    logger.info(f"Updated wellness_scores.final_energy_level for user_id={activity.user_id} -> {predicted_score}")
 
-    # --- 10. Mark processed for idempotency --------------------------------
-    mark_activity_processed(str(activity.id))
+        predicted_score = float(predicted_score)
+
+    except (TypeError, ValueError) as exc:
+
+        logger.error(
+            "Invalid prediction returned by ML: %r",
+            predicted_score,
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="ML returned an invalid prediction.",
+        ) from exc
+
+    if not 0 <= predicted_score <= 100:
+
+        logger.error(
+            "Prediction outside 0-100: %s",
+            predicted_score,
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "ML prediction must be between 0 and 100."
+            ),
+        )
+
+    predicted_score = round(
+        predicted_score,
+        2,
+    )
+
+    logger.info(
+        "Predicted score for user_id=%s = %s",
+        activity.user_id,
+        predicted_score,
+    )
+
+    # ========================================================
+    # STEP 13 — UPDATE WELLNESS SCORE
+    # ========================================================
+
+    """
+    IMPORTANT:
+
+    activity_history.user_id
+            |
+            v
+    wellness_scores.user_id
+            |
+            v
+    update ONLY that user's:
+
+    wellness_scores.final_energy_level
+    """
+
+    try:
+
+        update_user_energy_level(
+            str(activity.user_id),
+            predicted_score,
+        )
+
+    except WellnessRecordNotFoundError as exc:
+
+        logger.error(
+            "Could not update wellness_scores for "
+            "user_id=%s: %s",
+            activity.user_id,
+            exc,
+        )
+
+        # Activity is NOT marked done.
+
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+
+        logger.exception(
+            "Unexpected Supabase wellness update error "
+            "for user_id=%s",
+            activity.user_id,
+        )
+
+        # Activity is NOT marked done.
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to update "
+                "wellness_scores.final_energy_level."
+            ),
+        ) from exc
+
+    logger.info(
+        "UPDATED wellness_scores.final_energy_level: "
+        "user_id=%s -> %s",
+        activity.user_id,
+        predicted_score,
+    )
+
+    # ========================================================
+    # STEP 14 — MARK ACTIVITY AS DONE
+    # ========================================================
+
+    try:
+
+        mark_activity_processed(
+            str(activity.id)
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Could not mark activity %s as done.",
+            activity.id,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Wellness score was updated, "
+                "but activity could not be marked as done."
+            ),
+        ) from exc
+
+    logger.info(
+        "UPDATED activity_history.process='done': "
+        "activity_id=%s",
+        activity.id,
+    )
+
+    # ========================================================
+    # STEP 15 — SUCCESS RESPONSE
+    # ========================================================
 
     return WebhookResponse(
         success=True,
+        message=(
+            "Activity processed successfully and "
+            "wellness score updated."
+        ),
         user_id=str(activity.user_id),
+        activity_id=str(activity.id),
         activity_type=activity.activity_type,
         activity_energy_level=activity_energy_level,
         current_energy_level=current_energy_level,
         predicted_score=predicted_score,
+        process="done",
     )
