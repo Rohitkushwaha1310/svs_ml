@@ -1,0 +1,29 @@
+# Core data / ML
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# API
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0.0
+
+# Supabase + backend integration
+supabase>=2.4.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Testing
+pytest>=7.4.0
+httpx>=0.27.0
+
+# ---------------------------------------------------------------------------
+# Optional: XGBoost
+# ---------------------------------------------------------------------------
+# training/train.py auto-detects whether xgboost is installed and includes
+# XGBRegressor in the model comparison only if it is. The project trains,
+# evaluates, and serves predictions correctly with or without this line.
+# Uncomment to include it:
+#
+# xgboost>=2.0.0

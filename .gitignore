@@ -1,0 +1,62 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Testing / caching ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Secrets / environment variables ---
+.env
+.env.local
+.env.*.local
+!.env.example
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# Trained model artifacts
+# ---------------------------------------------------------------------------
+# models/svs_model.pkl, models/model_metrics.json, and models/test_split.csv
+# are intentionally NOT ignored here — see the tradeoff note below.
+#
+# Commit them (current choice) when:
+#   - you want anyone who clones the repo to run the API immediately
+#     without first running training/train.py
+#   - the model file is small (this one is — a handful of small sklearn trees)
+#   - you don't have a separate model registry / artifact store set up
+#
+# Ignore them instead when:
+#   - the model file is large (tens/hundreds of MB)
+#   - the dataset contains sensitive data you don't want baked into a
+#     binary artifact in version control
+#   - you have CI/CD that trains and publishes the model separately
+#
+# If you switch to the second approach later, uncomment:
+#
+# models/*.pkl
+# models/model_metrics.json
+# models/test_split.csv
