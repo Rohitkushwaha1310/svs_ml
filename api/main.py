@@ -11,7 +11,7 @@ retrained here. Training and prediction are fully separate concerns.
 
 NOTE ON THE OUTPUT FIELD NAME: this endpoint returns `predicted_score`, not
 `energy_level`. `predicted_score` is a pure ML/backend concept. The
-Supabase column the backend eventually writes this value into
+Supabase  the backend eventually writes this value into
 (`wellness_scores.final_energy_level`) is a different name on purpose —
 see api/supabase_client.py and api/webhook.py for where that mapping
 happens explicitly.
